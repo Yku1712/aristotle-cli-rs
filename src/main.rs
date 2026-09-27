@@ -4247,9 +4247,18 @@ async fn cmd_deploy(
             }
         }
 
+        // Determine the directory to deploy: prefer site/ if it exists
+        let deploy_path = if deploy_dir.join("site").exists() {
+            println!("  Using site/ subdirectory for deployment");
+            deploy_dir.join("site")
+        } else {
+            println!("  Using root directory for deployment");
+            deploy_dir
+        };
+
         // Set up Cloudflare API token for wrangler
         let mut wrangler_cmd = Command::new("wrangler");
-        wrangler_cmd.args(["pages", "deploy", &deploy_dir.to_string_lossy()]);
+        wrangler_cmd.args(["pages", "deploy", &deploy_path.to_string_lossy()]);
         wrangler_cmd.args(["--project-name", &project_name]);
         wrangler_cmd.args(["--commit-dirty=true"]);
 
@@ -4272,32 +4281,15 @@ async fn cmd_deploy(
         }
         println!("  ✓ Deployed to Cloudflare Pages project: {}", project_name);
 
-        // Add custom domain if specified
+        // Custom domain - wrangler doesn't support `pages domain add` in v4.x
+        // User must add domain manually via Cloudflare dashboard or API
         if let Some(domain) = deploy_domain {
-            println!("\n=== Adding custom domain {} ===", domain);
-            // Use wrangler to add domain to the project
-            let mut domain_cmd = Command::new("wrangler");
-            domain_cmd.args(["pages", "domain", "add", &domain, "--project-name", &project_name]);
-            
-            if let Some(ref token) = api_token {
-                domain_cmd.env("CLOUDFLARE_API_TOKEN", token);
-            }
-            if let Some(ref acct) = account_id {
-                domain_cmd.env("CLOUDFLARE_ACCOUNT_ID", acct);
-            }
-
-            let (domain_code, domain_out, domain_err) = run(&mut domain_cmd)?;
-            println!("{}", domain_out);
-            if !domain_err.is_empty() {
-                eprintln!("{}", domain_err);
-            }
-            if domain_code != 0 {
-                eprintln!("  ⚠️  Warning: Failed to add custom domain via wrangler (exit {})", domain_code);
-                eprintln!("     You may need to add the domain manually via Cloudflare dashboard or API");
-                eprintln!("     Command: wrangler pages domain add {} --project-name {}", domain, project_name);
-            } else {
-                println!("  ✓ Added custom domain: {}", domain);
-            }
+            println!("\n=== Custom domain: {} ===", domain);
+            println!("  To add this custom domain, go to Cloudflare Dashboard:");
+            println!("  https://dash.cloudflare.com/0ceffbadd0a04623896f5317a1e40d94/pages/view/{}", project_name);
+            println!("  Then: Custom domains → Add custom domain → {}", domain);
+            println!("  Or use API: POST /accounts/0ceffbadd0a04623896f5317a1e40d94/pages/projects/{}/domains", project_name);
+            println!("  With body: {{\"name\": \"{}\"}}", domain);
         }
     }
 
