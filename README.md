@@ -128,6 +128,51 @@ cargo run -- results
 cargo run -- clean
 ```
 
+### Deploy a Project
+
+```bash
+# Deploy to a local directory (default)
+cargo run -- deploy <project-id>
+
+# Deploy to Cloudflare Pages
+cargo run -- deploy <project-id> --cloudflare --name <wrangler-project-name>
+cargo run -- deploy <project-id> --cloudflare --name <wrangler-project-name> --public
+cargo run -- deploy <project-id> --cloudflare --name <wrangler-project-name> --domain example.com
+```
+
+#### Cloudflare Pages Deployment
+
+Deploy Lean4 projects to [Cloudflare Pages](https://pages.cloudflare.com) using
+`wrangler`. Prerequisites:
+
+1. **Install wrangler**: `npm install -g wrangler` (or use nix: `nix run wrangler`)
+2. **Cloudflare API token**: Write a raw token to `~/.cloudflare` or set the
+   `CLOUDFLARE_API_TOKEN` environment variable.
+3. **Cloudflare Account ID**: Set the `CLOUDFLARE_ACCOUNT_ID` environment variable.
+   If not set, a default account ID is used for the built-in token.
+
+The deploy command:
+
+- Creates a Pages project via `wrangler pages project create` (if it does not
+  already exist).
+- Deploys the project directory via `wrangler pages deploy --project-name <name>
+  --commit-dirty=true`.
+- If a `site/` subdirectory exists inside the project directory, that directory
+  is deployed instead (useful for projects with a nested web root).
+- Public pages are the default for Cloudflare Pages; use `--public` to make the
+  intent explicit.
+
+#### Custom Domain
+
+`wrangler` v4.x does not support `pages domain add`. When `--domain` is
+specified, the command prints manual instructions: visit the Cloudflare
+Dashboard for the project and add the custom domain, or call the
+`POST /accounts/{account_id}/pages/projects/{project_name}/domains` API.
+
+```bash
+cargo run -- deploy <project-id> --cloudflare --name <project-name> --domain example.com
+```
+
 ## Shell Scripts (Legacy)
 
 The shell scripts in this project (`poll.sh`, `poll-results.sh`, `build_all.sh`) are being migrated to Rust. They are still available but will be deprecated once the Rust migration is complete.
