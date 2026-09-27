@@ -427,6 +427,18 @@ enum Commands {
         /// Mark files as private (exclude from deployment)
         #[arg(long)]
         private: bool,
+        /// Deploy to Cloudflare Pages via wrangler
+        #[arg(long)]
+        cloudflare: bool,
+        /// Public deployment (Cloudflare Pages)
+        #[arg(long)]
+        public: bool,
+        /// Cloudflare Pages project name
+        #[arg(long)]
+        name: Option<String>,
+        /// Cloudflare Pages project domain
+        #[arg(long)]
+        domain: Option<String>,
     },
     /// Serve an Aristotle project with HTTP server
     ServeProject {
@@ -3985,6 +3997,18 @@ async fn cmd_download_result(project_id: &str, output_dir: Option<PathBuf>, verb
     Ok(())
 }
 
+/// Run a command and capture output
+fn run(cmd: &mut Command) -> Result<(i32, String, String)> {
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to spawn {}", cmd.get_program().to_string_lossy()))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 /// ── Deploy an Aristotle project with smart filtering ───────────
 
 async fn cmd_deploy(
@@ -3996,6 +4020,10 @@ async fn cmd_deploy(
     url: Option<String>,
     dry_run: bool,
     private: bool,
+    cloudflare: bool,
+    public: bool,
+    name: Option<String>,
+    domain: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
     let results_dir = output_dir.clone().unwrap_or_else(|| config.results_dir.join("aristo-outputs"));
@@ -4166,6 +4194,111 @@ async fn cmd_deploy(
 
     if let Some(url) = url {
         println!("Target URL: {}", url);
+    }
+
+    // Cloudflare Pages deployment via wrangler syscall
+    if cloudflare {
+        let project_name = name.clone().unwrap_or_else(|| project_id.to_string());
+        let deploy_domain = domain.clone();
+
+        println!("\n=== Deploying to Cloudflare Pages ===");
+        println!("  Project: {}", project_name);
+        if public {
+            println!("  Public deployment: enabled (Pages are public by default)");
+        }
+        if let Some(ref domain) = deploy_domain {
+            println!("  Custom domain: {}", domain);
+        }
+        println!("  Bundle: {}", deploy_dir.display());
+
+        // Read Cloudflare API token from ~/.cloudflare file (raw token) or environment variable
+        let api_token = std::fs::read_to_string("/home/mdupont/.cloudflare")
+            .ok()
+            .or_else(|| env::var("CLOUDFLARE_API_TOKEN").ok())
+            .map(|s| s.trim().to_string());
+
+        // Read Cloudflare Account ID from environment variable
+        let account_id = env::var("CLOUDFLARE_ACCOUNT_ID").ok();
+
+        // Create the Cloudflare Pages project if it doesn't exist
+        {
+            let mut create_cmd = Command::new("wrangler");
+            create_cmd.args(["pages", "project", "create", &project_name]);
+            create_cmd.args(["--production-branch", "main"]);
+            
+            if let Some(ref token) = api_token {
+                create_cmd.env("CLOUDFLARE_API_TOKEN", token);
+            }
+            if let Some(ref acct) = account_id {
+                create_cmd.env("CLOUDFLARE_ACCOUNT_ID", acct);
+            }
+
+            let (create_code, create_out, create_err) = run(&mut create_cmd)?;
+            println!("{}", create_out);
+            if !create_err.is_empty() {
+                eprintln!("{}", create_err);
+            }
+            // Ignore error if project already exists (exit code 1 with "already exists" message)
+            if create_code != 0 && !create_err.contains("already exists") && !create_out.contains("already exists") {
+                eprintln!("  ⚠️  Warning: Failed to create project (exit {})", create_code);
+                eprintln!("     You may need to create it manually: wrangler pages project create {}", project_name);
+            } else if create_code == 0 {
+                println!("  ✓ Created Cloudflare Pages project: {}", project_name);
+            }
+        }
+
+        // Set up Cloudflare API token for wrangler
+        let mut wrangler_cmd = Command::new("wrangler");
+        wrangler_cmd.args(["pages", "deploy", &deploy_dir.to_string_lossy()]);
+        wrangler_cmd.args(["--project-name", &project_name]);
+        wrangler_cmd.args(["--commit-dirty=true"]);
+
+        if let Some(ref token) = api_token {
+            wrangler_cmd.env("CLOUDFLARE_API_TOKEN", token);
+        } else {
+            eprintln!("  ⚠️  Warning: Cloudflare API token not found in credentials file");
+        }
+        if let Some(ref acct) = account_id {
+            wrangler_cmd.env("CLOUDFLARE_ACCOUNT_ID", acct);
+        }
+
+        let (code, out, err) = run(&mut wrangler_cmd)?;
+        println!("{}", out);
+        if !err.is_empty() {
+            eprintln!("{}", err);
+        }
+        if code != 0 {
+            anyhow::bail!("wrangler pages deploy failed (exit {})", code);
+        }
+        println!("  ✓ Deployed to Cloudflare Pages project: {}", project_name);
+
+        // Add custom domain if specified
+        if let Some(domain) = deploy_domain {
+            println!("\n=== Adding custom domain {} ===", domain);
+            // Use wrangler to add domain to the project
+            let mut domain_cmd = Command::new("wrangler");
+            domain_cmd.args(["pages", "domain", "add", &domain, "--project-name", &project_name]);
+            
+            if let Some(ref token) = api_token {
+                domain_cmd.env("CLOUDFLARE_API_TOKEN", token);
+            }
+            if let Some(ref acct) = account_id {
+                domain_cmd.env("CLOUDFLARE_ACCOUNT_ID", acct);
+            }
+
+            let (domain_code, domain_out, domain_err) = run(&mut domain_cmd)?;
+            println!("{}", domain_out);
+            if !domain_err.is_empty() {
+                eprintln!("{}", domain_err);
+            }
+            if domain_code != 0 {
+                eprintln!("  ⚠️  Warning: Failed to add custom domain via wrangler (exit {})", domain_code);
+                eprintln!("     You may need to add the domain manually via Cloudflare dashboard or API");
+                eprintln!("     Command: wrangler pages domain add {} --project-name {}", domain, project_name);
+            } else {
+                println!("  ✓ Added custom domain: {}", domain);
+            }
+        }
     }
 
     Ok(())
@@ -7067,10 +7200,10 @@ async fn main() -> Result<()> {
             let resolved = resolve_project_id(project_id)?;
             cmd_download_result(&resolved, output_dir.clone(), *verbose, account.as_deref()).await?;
         }
-        Commands::Deploy { project_id, output_dir, max_size, ignore, ignore_file, url, dry_run, private } => {
+        Commands::Deploy { project_id, output_dir, max_size, ignore, ignore_file, url, dry_run, private, cloudflare, public, name, domain } => {
             info!("Executing deploy command");
             let resolved = resolve_project_id(project_id)?;
-            cmd_deploy(&resolved, output_dir.clone(), *max_size, ignore.clone(), ignore_file.clone(), url.clone(), *dry_run, *private).await?;
+            cmd_deploy(&resolved, output_dir.clone(), *max_size, ignore.clone(), ignore_file.clone(), url.clone(), *dry_run, *private, *cloudflare, *public, name.clone(), domain.clone()).await?;
         }
         Commands::ServeProject { project_id, port, host, dir } => {
             info!("Executing serve-project command");
