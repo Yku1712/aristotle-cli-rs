@@ -235,13 +235,18 @@ fn handle_submit(
         saved_files.push(path.to_string_lossy().to_string());
     }
 
-    let lean_result = if !saved_files.is_empty() {
-        Some(run_lean_check(&work_dir, &saved_files))
+    // The verdict is the structured boolean computed by run_lean_check, never a
+    // substring search over output text (which also contains file names and
+    // Lean's own stdout/stderr).
+    let (lean_result, passed) = if !saved_files.is_empty() {
+        let (report, all_passed) = run_lean_check(&work_dir, &saved_files);
+        (Some(report), all_passed)
     } else {
-        Some("No .lean files submitted — skipping local check".to_string())
+        (
+            Some("No .lean files submitted — skipping local check".to_string()),
+            false,
+        )
     };
-
-    let passed = lean_result.as_ref().map_or(false, |r| r.contains("PASS"));
 
     let mut project = LocalProject {
         project_id: project_id.clone(),
@@ -361,9 +366,22 @@ fn handle_get_result(id: &str, state: &Arc<Mutex<ServerState>>) -> String {
 
 // ── Lean4 proof checker ───────────────────────────────────────────────
 
-fn run_lean_check(work_dir: &Path, files: &[String]) -> String {
+/// Aggregate submission verdict, computed only from structured per-file
+/// results: `true` iff at least one file was checked and every checked file
+/// passed.  Output text is never consulted, and ordering is irrelevant.
+fn submission_verdict(per_file_passed: &[bool]) -> bool {
+    !per_file_passed.is_empty() && per_file_passed.iter().all(|&p| p)
+}
+
+/// Returns the human-readable report and the aggregate verdict
+/// (see [`submission_verdict`]).
+fn run_lean_check(work_dir: &Path, files: &[String]) -> (String, bool) {
+    run_lean_check_with("lean", work_dir, files)
+}
+
+fn run_lean_check_with(lean: &str, work_dir: &Path, files: &[String]) -> (String, bool) {
     let mut output = String::new();
-    let mut all_passed = true;
+    let mut per_file_passed = Vec::with_capacity(files.len());
 
     for file in files {
         let path = Path::new(file);
@@ -372,21 +390,17 @@ fn run_lean_check(work_dir: &Path, files: &[String]) -> String {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        match Command::new("lean")
-            .arg(file)
-            .current_dir(work_dir)
-            .output()
-        {
+        match Command::new(lean).arg(file).current_dir(work_dir).output() {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                per_file_passed.push(out.status.success());
                 if out.status.success() {
                     output.push_str(&format!("PASS {} (status=0)\n", filename));
                     if !stdout.is_empty() {
                         output.push_str(&format!("  stdout: {}\n", stdout.trim()));
                     }
                 } else {
-                    all_passed = false;
                     output.push_str(&format!("FAIL {} (status={})\n", filename, out.status));
                     if !stdout.is_empty() {
                         output.push_str(&format!("  stdout: {}\n", stdout.trim()));
@@ -397,19 +411,20 @@ fn run_lean_check(work_dir: &Path, files: &[String]) -> String {
                 }
             }
             Err(e) => {
-                all_passed = false;
+                per_file_passed.push(false);
                 output.push_str(&format!("ERROR {}: {}\n", filename, e));
             }
         }
     }
 
+    let all_passed = submission_verdict(&per_file_passed);
     if all_passed {
         output.push_str("\n=== ALL PROOFS PASSED ===");
     } else {
         output.push_str("\n=== SOME PROOFS FAILED ===");
     }
 
-    output
+    (output, all_passed)
 }
 
 // ── Remote forwarding ─────────────────────────────────────────────────
@@ -552,4 +567,113 @@ fn uuid_v4() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("local-{:016x}", now.as_nanos() & 0xffffffffffffffff)
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    #[test]
+    fn verdict_requires_every_file_and_at_least_one() {
+        assert!(submission_verdict(&[true]));
+        assert!(submission_verdict(&[true, true, true]));
+        assert!(!submission_verdict(&[true, false]));
+        assert!(!submission_verdict(&[false, true]));
+        assert!(!submission_verdict(&[false, false, true]));
+        assert!(!submission_verdict(&[]));
+    }
+
+    /// Hermetic stand-in for `lean`: always prints text containing "PASS" on
+    /// stdout and stderr, and fails (exit 1) iff the file contains `FAILME`.
+    #[cfg(unix)]
+    fn fake_lean(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-lean");
+        fs::write(
+            &bin,
+            "#!/bin/sh\n\
+             echo \"PASS stdout: === ALL PROOFS PASSED ===\"\n\
+             if grep -q FAILME \"$1\"; then echo \"PASS error: PASS\" >&2; exit 1; fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().to_string()
+    }
+
+    #[cfg(unix)]
+    fn check(files: &[(&str, &str)]) -> (String, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let lean = fake_lean(dir.path());
+        let work = dir.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let paths: Vec<String> = files
+            .iter()
+            .map(|(name, body)| {
+                let p = work.join(name);
+                fs::write(&p, body).unwrap();
+                p.to_string_lossy().to_string()
+            })
+            .collect();
+        run_lean_check_with(&lean, &work, &paths)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_files_pass_submission_passes() {
+        let (_, passed) = check(&[("A.lean", "ok"), ("B.lean", "ok")]);
+        assert!(passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_pass_one_fail_submission_fails_in_any_order() {
+        assert!(!check(&[("A.lean", "ok"), ("B.lean", "FAILME")]).1);
+        assert!(!check(&[("B.lean", "FAILME"), ("A.lean", "ok")]).1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_file_whose_output_contains_pass_fails() {
+        let (report, passed) = check(&[("PASS.lean", "FAILME")]);
+        assert!(
+            report.contains("PASS"),
+            "fixture must put PASS in the report"
+        );
+        assert!(!passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multiple_outputs_with_only_one_pass_fails() {
+        let (report, passed) = check(&[
+            ("X.lean", "FAILME"),
+            ("Ok.lean", "ok"),
+            ("Y.lean", "FAILME"),
+        ]);
+        assert!(report.contains("PASS Ok.lean"));
+        assert!(!passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_checked_files_fails() {
+        let (_, passed) = check(&[]);
+        assert!(!passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_lean_binary_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("A.lean");
+        fs::write(&f, "ok").unwrap();
+        let missing = dir.path().join("no-such-lean");
+        let (_, passed) = run_lean_check_with(
+            &missing.to_string_lossy(),
+            dir.path(),
+            &[f.to_string_lossy().to_string()],
+        );
+        assert!(!passed);
+    }
 }
