@@ -850,4 +850,41 @@ mod tests {
         // A theorem from the toolchain is not evidence from the submission.
         assert!(!real(&[("A.lean", CLEAN)], &["target", "Nat.add_comm"]).accepted);
     }
+
+    // ── Cross-file imports between submitted files ─────────────────────
+    //
+    // Each submitted file is compiled on its own (both by the pre-policy
+    // `lean <file>` step and by the policy), and neither step builds an
+    // `.olean` for a sibling, so `import Helper` of a submitted `Helper.lean`
+    // never resolves.  These pin that the policy fails closed on it (at its
+    // compile step, never later) instead of accepting or crashing.
+
+    const HELPER: &str = "theorem helper : True := by trivial\n";
+    const MAIN_IMPORTS_HELPER: &str = "import Helper\ntheorem target : True := helper\n";
+
+    #[test]
+    #[ignore = "needs lean + leanchecker on PATH"]
+    fn real_cross_file_import_is_rejected_at_compile() {
+        for files in [
+            [("Helper.lean", HELPER), ("Main.lean", MAIN_IMPORTS_HELPER)],
+            [("Main.lean", MAIN_IMPORTS_HELPER), ("Helper.lean", HELPER)],
+        ] {
+            let v = real(&files, &["target"]);
+            assert!(!v.accepted);
+            assert!(v.reasons.iter().any(|r| r.starts_with("Main.lean: does not compile")
+                && r.contains("unknown module prefix 'Helper'")));
+            assert!(!v.reasons.iter().any(|r| r.contains("leanchecker") || r.contains("inspector")));
+            assert!(v.reasons.iter().any(|r| r.contains("`target` was not found")));
+        }
+        // A required theorem that lives in the (clean) sibling is still found there.
+        assert!(real(&[("Helper.lean", HELPER)], &["helper"]).accepted);
+    }
+
+    #[test]
+    #[ignore = "needs lean + leanchecker on PATH"]
+    fn real_missing_import_is_rejected() {
+        let v = real(&[("Main.lean", "import DoesNotExist\ntheorem target : True := trivial\n")], &["target"]);
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("does not compile")));
+    }
 }

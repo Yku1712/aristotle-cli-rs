@@ -779,4 +779,19 @@ mod proof_policy_wiring_tests {
         let broken = r#"{"prompt":"p","files":{"Wiring.lean":"theorem wiring_target : 2 + 2 = 5 := rfl\n"},"required_theorems":["wiring_target"]}"#;
         assert!(submit(broken).contains("=== PROOF POLICY: NOT EVALUATED (compile failed) ==="));
     }
+
+    /// Submitted files are compiled one by one with `lean <file>`, which
+    /// builds no `.olean`, so a sibling import never resolves: the pre-policy
+    /// compile already fails and the policy is not evaluated.
+    #[test]
+    #[ignore = "needs lean + leanchecker on PATH"]
+    fn submit_cross_file_import_fails_before_policy() {
+        let json = r#"{"prompt":"p","files":{"Helper.lean":"theorem helper : True := by trivial\n","Main.lean":"import Helper\ntheorem target : True := helper\n"},"required_theorems":["target"]}"#;
+        let r = submit(json);
+        assert!(r.contains("PASS Helper.lean"));
+        assert!(r.contains("FAIL Main.lean"));
+        assert!(r.contains("unknown module prefix 'Helper'"));
+        assert!(r.contains("=== SOME PROOFS FAILED ==="));
+        assert!(r.contains("=== PROOF POLICY: NOT EVALUATED (compile failed) ==="));
+    }
 }
