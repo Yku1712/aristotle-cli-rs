@@ -28,8 +28,9 @@
 //! [`ALLOWED_AXIOMS`].  `native_decide` is rejected (see [`NATIVE_AXIOMS`]).
 
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde::Deserialize;
@@ -287,6 +288,31 @@ pub fn check_submission_with(
     files: &[(String, String)],
     required: &[String],
 ) -> PolicyVerdict {
+    let inherited = std::env::var_os("LEAN_PATH");
+    check_submission_in(
+        lean,
+        leanchecker,
+        work_dir,
+        inherited.as_deref(),
+        files,
+        required,
+    )
+}
+
+/// Like [`check_submission_with`], with the operator's `LEAN_PATH` passed
+/// explicitly.  The compile step sees exactly `lean_path` (as the existing
+/// `lean <file>` step does, by inheritance); kernel replay and the inspector
+/// see the private `.olean` directory first, followed by `lean_path`, so a
+/// library the compile step resolved is also resolvable when the module is
+/// replayed and inspected.
+fn check_submission_in(
+    lean: &str,
+    leanchecker: &str,
+    work_dir: &Path,
+    lean_path: Option<&OsStr>,
+    files: &[(String, String)],
+    required: &[String],
+) -> PolicyVerdict {
     let (set, problems) = required_set(required);
     if !problems.is_empty() {
         return PolicyVerdict {
@@ -298,7 +324,9 @@ pub fn check_submission_with(
     let required: Vec<String> = set.into_iter().map(String::from).collect();
     let checks: Vec<FileCheck> = files
         .iter()
-        .map(|(name, content)| check_file(lean, leanchecker, work_dir, name, content, &required))
+        .map(|(name, content)| {
+            check_file(lean, leanchecker, work_dir, lean_path, name, content, &required)
+        })
         .collect();
     evaluate(&required, &checks)
 }
@@ -321,6 +349,17 @@ fn diagnostics(out: &Output) -> String {
     joined.chars().take(300).collect()
 }
 
+/// `LEAN_PATH` for kernel replay and inspection: the private `.olean`
+/// directory first (so `SUBMISSION_MODULE` always resolves to the module just
+/// compiled), then the operator's entries.
+fn replay_lean_path(olean_dir: &Path, lean_path: Option<&OsStr>) -> Result<OsString, String> {
+    let mut entries: Vec<PathBuf> = vec![olean_dir.to_path_buf()];
+    if let Some(p) = lean_path {
+        entries.extend(std::env::split_paths(p).filter(|e| !e.as_os_str().is_empty()));
+    }
+    std::env::join_paths(entries).map_err(|e| format!("could not build LEAN_PATH: {}", e))
+}
+
 /// Run the three stages for one file.  Every Lean process runs with
 /// `current_dir(work_dir)`, like the existing compile step, so toolchain
 /// selection is unchanged; only the private copy and its build products live
@@ -329,6 +368,7 @@ fn check_file(
     lean: &str,
     leanchecker: &str,
     work_dir: &Path,
+    lean_path: Option<&OsStr>,
     name: &str,
     content: &str,
     required: &[String],
@@ -362,16 +402,28 @@ fn check_file(
     let src_dir = src.parent().unwrap_or(tmp.path()).to_path_buf();
     let olean = olean_dir.join(format!("{}.olean", SUBMISSION_MODULE));
 
+    let replay_path = match replay_lean_path(&olean_dir, lean_path) {
+        Ok(p) => p,
+        Err(e) => {
+            fc.errors.push(e);
+            return fc;
+        }
+    };
+
     // 1. Compile to an .olean.
-    match Command::new(lean)
+    let mut compile = Command::new(lean);
+    compile
         .arg("-R")
         .arg(&src_dir)
         .arg("-o")
         .arg(&olean)
         .arg(&src)
-        .current_dir(work_dir)
-        .output()
-    {
+        .current_dir(work_dir);
+    match lean_path {
+        Some(p) => compile.env("LEAN_PATH", p),
+        None => compile.env_remove("LEAN_PATH"),
+    };
+    match compile.output() {
         Ok(out) if out.status.success() && olean.is_file() => {}
         Ok(out) => {
             let msg = diagnostics(&out).replace(&*src.to_string_lossy(), &fc.file);
@@ -388,7 +440,7 @@ fn check_file(
     // 2. Kernel replay of every declaration in the module.
     match Command::new(leanchecker)
         .arg(SUBMISSION_MODULE)
-        .env("LEAN_PATH", &olean_dir)
+        .env("LEAN_PATH", &replay_path)
         .current_dir(work_dir)
         .output()
     {
@@ -414,7 +466,7 @@ fn check_file(
         .arg(&inspector)
         .arg(SUBMISSION_MODULE)
         .args(required)
-        .env("LEAN_PATH", &olean_dir)
+        .env("LEAN_PATH", &replay_path)
         .current_dir(work_dir)
         .output()
     {
@@ -886,5 +938,130 @@ mod tests {
         let v = real(&[("Main.lean", "import DoesNotExist\ntheorem target : True := trivial\n")], &["target"]);
         assert!(!v.accepted);
         assert!(v.reasons.iter().any(|r| r.contains("does not compile")));
+    }
+
+    #[test]
+    fn replay_lean_path_puts_private_oleans_first() {
+        let p = replay_lean_path(Path::new("/priv/olean"), None).unwrap();
+        assert_eq!(p, OsString::from("/priv/olean"));
+        let p = replay_lean_path(Path::new("/priv/olean"), Some(OsStr::new("/lib/a::/lib/b")))
+            .unwrap();
+        let entries: Vec<PathBuf> = std::env::split_paths(&p).collect();
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/priv/olean"),
+                PathBuf::from("/lib/a"),
+                PathBuf::from("/lib/b")
+            ]
+        );
+    }
+
+    // ── Imports resolved through the operator's LEAN_PATH ──────────────
+    //
+    // The existing `lean <file>` step inherits the server's LEAN_PATH, so a
+    // submission may import a library the operator provides there.  Kernel
+    // replay and the inspector must resolve the same library; facts about
+    // it are still checked by the same rules.
+
+    /// Compile `modules` (in order) into a fresh library directory with the
+    /// toolchain under test and return it.
+    fn build_lib(modules: &[(&str, &str)]) -> tempfile::TempDir {
+        let lib = tempfile::tempdir().unwrap();
+        for (m, body) in modules {
+            let src = lib.path().join(format!("{}.lean", m));
+            fs::write(&src, body).unwrap();
+            let out = Command::new("lean")
+                .arg("-R")
+                .arg(lib.path())
+                .arg("-o")
+                .arg(lib.path().join(format!("{}.olean", m)))
+                .arg(&src)
+                .env("LEAN_PATH", lib.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}: {}", m, diagnostics(&out));
+        }
+        lib
+    }
+
+    fn real_with_path(lib: Option<&Path>, files: &[(&str, &str)], required: &[&str]) -> PolicyVerdict {
+        let dir = tempfile::tempdir().unwrap();
+        let files_owned: Vec<(String, String)> = files
+            .iter()
+            .map(|(n, body)| (n.to_string(), body.to_string()))
+            .collect();
+        let v = check_submission_in(
+            "lean",
+            "leanchecker",
+            dir.path(),
+            lib.map(Path::as_os_str),
+            &files_owned,
+            &req(required),
+        );
+        eprintln!("{:?} (LEAN_PATH {:?}) -> {}", files.iter().map(|f| f.0).collect::<Vec<_>>(), lib, v.report());
+        v
+    }
+
+    #[test]
+    #[ignore = "needs lean + leanchecker on PATH"]
+    fn real_library_import_through_lean_path() {
+        let lib = build_lib(&[
+            ("Lib", "theorem lib_thm : True := trivial\n"),
+            ("LibSorry", "theorem lib_sorry : 2 + 2 = 5 := sorry\n"),
+            ("LibAxiom", "axiom lib_ax : False\n"),
+            ("LibNative", "theorem lib_native : 10 < 20 := by native_decide\n"),
+        ]);
+        let lib = Some(lib.path());
+        let main = "import Lib\ntheorem target : True := lib_thm\n";
+
+        // Clean import: accepted; kernel replay and inspection resolve `Lib`.
+        assert!(real_with_path(lib, &[("Main.lean", main)], &["target"]).accepted);
+        // Same file without the library on LEAN_PATH: rejected at compile.
+        let v = real_with_path(None, &[("Main.lean", main)], &["target"]);
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("does not compile")));
+        // Missing module: rejected.
+        assert!(
+            !real_with_path(lib, &[("Main.lean", "import NoSuchLib\ntheorem target : True := trivial\n")], &["target"])
+                .accepted
+        );
+        // A theorem declared by the library is not evidence from the submission.
+        assert!(!real_with_path(lib, &[("Main.lean", main)], &["target", "lib_thm"]).accepted);
+
+        // sorry / custom axiom / native_decide inside the imported module
+        // still reject the required theorem that depends on it.
+        let v = real_with_path(
+            lib,
+            &[("Main.lean", "import LibSorry\ntheorem target : 2 + 2 = 5 := lib_sorry\n")],
+            &["target"],
+        );
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("depends on sorry/admit")));
+        let v = real_with_path(
+            lib,
+            &[("Main.lean", "import LibAxiom\ntheorem target : 2 + 2 = 5 := lib_ax.elim\n")],
+            &["target"],
+        );
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("non-allowed axiom `lib_ax`")));
+        let v = real_with_path(
+            lib,
+            &[("Main.lean", "import LibNative\ntheorem target : 10 < 20 := lib_native\n")],
+            &["target"],
+        );
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("native_decide")));
+    }
+
+    #[test]
+    #[ignore = "needs lean + leanchecker on PATH"]
+    fn real_lean_path_cannot_shadow_the_submission() {
+        // A clean `AristotleSubmission` on the operator's LEAN_PATH must not
+        // stand in for the submitted module during replay and inspection.
+        let lib = build_lib(&[(SUBMISSION_MODULE, CLEAN)]);
+        let v = real_with_path(Some(lib.path()), &[("Main.lean", SORRY)], &["target"]);
+        assert!(!v.accepted);
+        assert!(v.reasons.iter().any(|r| r.contains("contains sorry/admit")));
     }
 }
